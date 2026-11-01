@@ -1,0 +1,192 @@
+name: Build Tinycast release
+
+# Every stable Tinycast release is rebuilt with patches/, signed with this repo's own certificate and
+# published here under the same tag. The patched app's in-app updater reads these releases.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tinycast tag to (re)build, e.g. v0.12.1; empty = latest stable"
+        type: string
+        required: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+env:
+  UPSTREAM_REPO: abue-ammar/tinycast
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      runner: ${{ steps.check.outputs.runner }}
+      xcode: ${{ steps.check.outputs.xcode }}
+    steps:
+      # GitHub turns schedules off after 60 quiet days; re-enabling resets that clock.
+      - name: Keep the schedule alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable release.yml -R "$GITHUB_REPOSITORY"
+
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="${INPUT_TAG:-$(gh release view -R "$UPSTREAM_REPO" --json tagName -q .tagName)}"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a stable tag: $TAG"; exit 1; }
+          if [ -z "$INPUT_TAG" ]; then
+            if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              echo "$TAG already built"; exit 0
+            fi
+            # A blocked build is reported once and waits for a manual run, not one Mac build an hour.
+            if gh issue list -R "$GITHUB_REPOSITORY" --state open --json title -q '.[].title' \
+                 | grep -qxF "Build blocked: $TAG"; then
+              echo "$TAG is blocked"; exit 0
+            fi
+          fi
+          # Build on whatever machine and Xcode that Tinycast release builds on itself.
+          UPSTREAM_YML="$(gh api "repos/$UPSTREAM_REPO/contents/.github/workflows/release.yml?ref=$TAG" -H 'Accept: application/vnd.github.raw')"
+          RUNNER="$(grep -m1 -E '^ +runs-on:' <<< "$UPSTREAM_YML" | awk '{print $2}')"
+          XCODE="$(grep -m1 -oE 'Xcode_[0-9]+' <<< "$UPSTREAM_YML" | cut -d_ -f2)"
+          [ -n "$RUNNER" ] && [ -n "$XCODE" ] || { echo "cannot read the runner from Tinycast's workflow"; exit 1; }
+          { echo "tag=$TAG"; echo "runner=$RUNNER"; echo "xcode=$XCODE"; } | tee -a "$GITHUB_OUTPUT"
+
+  release:
+    needs: check
+    if: needs.check.outputs.tag != ''
+    runs-on: ${{ needs.check.outputs.runner }}
+    timeout-minutes: 120
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      XCODE: ${{ needs.check.outputs.xcode }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: fork
+
+      - uses: actions/checkout@v7
+        with:
+          repository: abue-ammar/tinycast
+          ref: ${{ needs.check.outputs.tag }}
+          path: src
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: |
+          # Real folders only: an Xcode_N.M.app symlink can point at a release candidate.
+          XCODE_PATH="$(find -E /Applications -maxdepth 1 -type d -regex ".*/Xcode_$XCODE(\.[0-9]+)*\.app" | sort -V | tail -n1)"
+          [ -n "$XCODE_PATH" ] || { ls /Applications | grep -i xcode; exit 1; }
+          echo "DEVELOPER_DIR=$XCODE_PATH/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Apply the patches
+        working-directory: src
+        run: |
+          echo "UP=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          git config user.name "tinycast-fork"
+          git config user.email "tinycast-fork@users.noreply.github.com"
+          for patch in ../fork/patches/*.patch; do
+            echo "applying ${patch##*/}"
+            git apply --3way --whitespace=nowarn "$patch"
+          done
+          git add -A
+          git commit -q -m "tinycast-fork patches on $TAG"
+
+      - name: Build and test
+        working-directory: src
+        run: ../fork/gate.sh "$UP"
+
+      # The SAME cert on every release is what keeps the Accessibility grant across updates.
+      - name: Import signing certificate
+        env:
+          P12_BASE64: ${{ secrets.SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KPW="$(openssl rand -base64 24)"
+          echo "${P12_BASE64}" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KPW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KPW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "${P12_PASSWORD}" -A -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build signed app
+        working-directory: src
+        run: |
+          xcodebuild -project Tinycast.xcodeproj -scheme Tinycast -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Tinycast Self-Signed" \
+            OTHER_CODE_SIGN_FLAGS="--timestamp=none" \
+            PRODUCT_NAME="Tinycast" TINYCAST_BUNDLE_IDENTIFIER="com.tinycast.app" \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            build
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release/Tinycast.app"
+          ./Scripts/verify-signature.sh "$APP"
+          codesign -dvvv "$APP" 2>&1 | grep -qx "Authority=Tinycast Self-Signed"
+
+      - name: Package
+        working-directory: src
+        run: |
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release/Tinycast.app"
+          STAGE="$(mktemp -d)"
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          DIST="$RUNNER_TEMP/dist"; mkdir -p "$DIST"
+          diskutil image create from "$STAGE" --format UDZO --volumeName "Tinycast" "$DIST/Tinycast-$VERSION.dmg"
+          # Only ditto keeps the signature verifiable. The updater takes the zip.
+          ditto -c -k --keepParent --sequesterRsrc "$APP" "$DIST/Tinycast-$VERSION.zip"
+          # Tinycast is AGPL: the exact source of this build ships beside it.
+          git archive --format=tar.gz --prefix="tinycast-$VERSION/" -o "$DIST/tinycast-$VERSION-source.tar.gz" HEAD
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Bare #123 would resolve against this repo, so they become explicit links to Tinycast.
+          gh release view "$TAG" -R "$UPSTREAM_REPO" --json body -q .body \
+            | sed '/<!-- tinycast:install -->/,$d' \
+            | perl -pe 's{(^|[\s(])#(\d+)\b}{$1\[#$2\](https://github.com/abue-ammar/tinycast/pull/$2)}g' \
+            > "$RUNNER_TEMP/upstream.md"
+          {
+            echo "[Tinycast $VERSION](https://github.com/$UPSTREAM_REPO/releases/tag/$TAG) with this repo's [patches](https://github.com/$GITHUB_REPOSITORY/tree/main/patches)."
+            echo
+            cat "$RUNNER_TEMP/upstream.md"
+          } > "$RUNNER_TEMP/notes.md"
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" -y --cleanup-tag > /dev/null 2>&1 || true
+          gh release create "$TAG" "$RUNNER_TEMP"/dist/* -R "$GITHUB_REPOSITORY" --target main --latest \
+            --title "Tinycast $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+
+      - name: Close blocked issue
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue list -R "$GITHUB_REPOSITORY" --state open --json number,title \
+            -q ".[] | select(.title == \"Build blocked: $TAG\") | .number" \
+            | while read -r n; do gh issue close "$n" -R "$GITHUB_REPOSITORY" -c "Built."; done
+
+      - name: Report blocked build
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Build blocked: $TAG"
+          if ! gh issue list -R "$GITHUB_REPOSITORY" --state open --json title -q '.[].title' | grep -qxF "$TITLE"; then
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$TITLE" \
+              --body "The patches did not build on $TAG, so nothing was published and installed copies stay put. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. Fix the patch, then run this workflow by hand with the tag."
+          fi
