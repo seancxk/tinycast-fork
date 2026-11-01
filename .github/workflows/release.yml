@@ -4,7 +4,7 @@ name: Build Tinycast release
 # published here under the same tag. The patched app's in-app updater reads these releases.
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       tag:
@@ -49,7 +49,7 @@ jobs:
             if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
               echo "$TAG already built"; exit 0
             fi
-            # A blocked build is reported once and waits for a manual run, not one Mac build an hour.
+            # A blocked build is reported once and waits for a manual run, not one Mac build a day.
             if gh issue list -R "$GITHUB_REPOSITORY" --state open --json title -q '.[].title' \
                  | grep -qxF "Build blocked: $TAG"; then
               echo "$TAG is blocked"; exit 0

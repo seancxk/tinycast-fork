@@ -15,7 +15,7 @@ This repo holds no copy of Tinycast's code, only what differs:
   Settings panes never jump.
 - [patches/0002-updater.patch](patches/0002-updater.patch): points the in-app updater here, so an update
   can't replace this build with one that lacks the change.
-- [.github/workflows/release.yml](.github/workflows/release.yml): checks hourly for a new stable Tinycast
+- [.github/workflows/release.yml](.github/workflows/release.yml): checks daily for a new stable Tinycast
   release, applies the patches to it, builds, runs Tinycast's tests (with [gate.sh](gate.sh)), signs and
   publishes under the same version number. Each release includes the exact source of its build.
 
